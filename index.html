@@ -490,55 +490,92 @@ function parseKakao(text){
 
 // ──────────────────────────────
 // 스마트스토어 엑셀 파싱
+// 스마트스토어 .xls는 실제로 HTML 테이블 형식 → 자동 감지해서 처리
 // ──────────────────────────────
+
+function parseSSRows(data){
+  // data = [[col,col,...], ...] 형태
+  const orders = [];
+
+  // 헤더 행 찾기
+  let headerRow = -1;
+  for(let i=0;i<Math.min(10,data.length);i++){
+    const row = (data[i]||[]).map(c=>String(c||''));
+    if(row.some(c=>/상품명/.test(c))){ headerRow=i; break; }
+  }
+  if(headerRow < 0) return orders;
+
+  const headers = (data[headerRow]||[]).map(c=>String(c||''));
+  const productCol = headers.findIndex(h=>/상품명/.test(h));
+  const optionCol  = headers.findIndex(h=>/옵션값|옵션/.test(h));
+  const qtyCol     = headers.findIndex(h=>/^수량$/.test(h.trim()));
+
+  for(let i=headerRow+1;i<data.length;i++){
+    const row = data[i];
+    if(!row) continue;
+
+    // 행이 짧거나 상품명 없으면 출고지 병합셀 행 → 건너뜀
+    const productText = String(row[productCol]||'').trim();
+    if(!productText || /^\d{5}/.test(productText)) continue; // 우편번호 행 제외
+
+    const optionText = optionCol>=0 ? String(row[optionCol]||'') : '';
+    const orderQty   = parseInt(String(row[qtyCol]||'1'))||1;
+
+    const matched = matchProduct(productText) || matchProduct(optionText);
+    if(!matched) continue;
+
+    // 용량: 옵션값 우선 → 상품명 순서로 추출
+    const textForQty = optionText || productText;
+    const qMatch = textForQty.match(/([\d.]+)\s*(kg|g)/i)
+                || productText.match(/([\d.]+)\s*(kg|g)/i);
+    let qty_g = 1000;
+    if(qMatch){
+      qty_g = parseQtyToGrams(qMatch[1], qMatch[2]) * orderQty;
+    } else {
+      qty_g = 1000 * orderQty;
+    }
+
+    orders.push({
+      product: matched.name,
+      qty_g,
+      source: '스마트스토어',
+      raw: `${productText}${optionText?' / '+optionText:''} ×${orderQty}`
+    });
+  }
+  return orders;
+}
+
 function handleSSFile(input){
   const file = input.files[0];
   if(!file) return;
   const reader = new FileReader();
   reader.onload = e => {
     try{
-      const wb = XLSX.read(e.target.result, {type:'binary'});
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const data = XLSX.utils.sheet_to_json(ws, {header:1});
+      const raw = e.target.result;
+      let data = [];
 
-      // 헤더 찾기
-      let headerRow = -1;
-      for(let i=0;i<Math.min(10,data.length);i++){
-        const row = (data[i]||[]).map(c=>String(c||''));
-        if(row.some(c=>/상품|품목|주문|수량/.test(c))){ headerRow=i; break; }
+      // HTML 형식 감지 (스마트스토어 xls는 실제로 HTML)
+      const isHTML = typeof raw === 'string'
+        ? raw.trimStart().startsWith('<')
+        : false;
+
+      if(isHTML){
+        // HTML 테이블 파싱
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(raw, 'text/html');
+        const rows = doc.querySelectorAll('table tr');
+        rows.forEach(tr=>{
+          const cells = [...tr.querySelectorAll('th,td')].map(td=>td.innerText||td.textContent||'');
+          data.push(cells);
+        });
+      } else {
+        // 진짜 xlsx/xls
+        const wb = XLSX.read(raw, {type:'binary'});
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        data = XLSX.utils.sheet_to_json(ws, {header:1});
       }
 
-      const orders = [];
-      if(headerRow >= 0){
-        const headers = (data[headerRow]||[]).map(c=>String(c||''));
-        const productCol = headers.findIndex(h=>/상품명|품목명|상품/.test(h));
-        const qtyCol = headers.findIndex(h=>/수량|주문수량/.test(h));
-        const nameCol = headers.findIndex(h=>/주문자|구매자|성명/.test(h));
-
-        for(let i=headerRow+1;i<data.length;i++){
-          const row = data[i];
-          if(!row || !row[productCol]) continue;
-          const productText = String(row[productCol]||'');
-          const qty = parseInt(row[qtyCol])||1;
-          const buyerName = nameCol>=0 ? String(row[nameCol]||'') : '고객';
-
-          const matched = matchProduct(productText);
-          if(matched){
-            // 스마트스토어는 보통 100g/200g/1kg 단위 상품명
-            let qty_g = 1000;
-            const gMatch = productText.match(/([\d.]+)\s*(kg|g)/i);
-            if(gMatch){
-              const num = parseFloat(gMatch[1]);
-              const unit = gMatch[2].toLowerCase();
-              qty_g = unit==='g' ? Math.round(num*qty) : Math.round(num*1000*qty);
-            } else {
-              qty_g = 1000 * qty;
-            }
-            orders.push({product:matched.name, qty_g, source:'스마트스토어', raw:`${buyerName} · ${productText} ×${qty}`});
-          }
-        }
-      }
-
+      const orders = parseSSRows(data);
       ssOrders = orders;
       const zone = document.getElementById('ss-zone');
       zone.innerHTML = `<div style="color:var(--green);font-size:12px;font-weight:500;">✓ ${file.name}</div>
@@ -548,7 +585,26 @@ function handleSSFile(input){
       document.getElementById('ss-result').innerHTML = `<div style="color:var(--red);font-size:11px;">파일 읽기 오류: ${err.message}</div>`;
     }
   };
-  reader.readAsBinaryString(file);
+  // 파일 확장자/타입에 따라 읽기 방식 분기
+  // 스마트스토어 xls는 HTML이므로 텍스트로 먼저 읽고 감지
+  reader.readAsText(file, 'utf-8');
+  reader.onerror = () => {
+    // 텍스트 읽기 실패시 바이너리로 재시도 (진짜 xlsx)
+    const r2 = new FileReader();
+    r2.onload = e2 => {
+      try{
+        const wb = XLSX.read(e2.target.result, {type:'binary'});
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const data = XLSX.utils.sheet_to_json(ws, {header:1});
+        const orders = parseSSRows(data);
+        ssOrders = orders;
+        document.getElementById('ss-zone').innerHTML =
+          `<div style="color:var(--green);font-size:12px;">✓ ${file.name} — ${orders.length}건</div>`;
+        document.getElementById('stat-ss').textContent = orders.length;
+      }catch(err2){}
+    };
+    r2.readAsBinaryString(file);
+  };
 }
 
 function handleDrop(e, type){
