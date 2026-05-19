@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>먼스커피 · 일일 발주 집계</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@300;400&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 :root{
@@ -578,47 +578,72 @@ function parseSSRows(data){
 function handleSSFile(input){
   const file = input.files[0];
   if(!file) return;
+
+  const showResult = (orders) => {
+    ssOrders = orders;
+    document.getElementById('ss-zone').innerHTML =
+      `<div style="color:var(--green);font-size:12px;font-weight:500;">✓ ${file.name}</div>
+       <div class="upload-success">${orders.length}건 인식 완료</div>`;
+    document.getElementById('stat-ss').textContent = orders.length;
+  };
+
+  const showError = (msg) => {
+    document.getElementById('ss-result').innerHTML =
+      `<div style="color:var(--red);font-size:11px;">파일 읽기 오류: ${msg}</div>`;
+  };
+
+  const parseHTMLxls = (text) => {
+    const doc = new DOMParser().parseFromString(text, 'text/html');
+    const data = [];
+    doc.querySelectorAll('table tr').forEach(tr=>{
+      const cells = [...tr.querySelectorAll('th,td')].map(td=>(td.textContent||'').trim());
+      data.push(cells);
+    });
+    return data;
+  };
+
+  const parseCSV = (text) => {
+    return text.split('\n').map(line=>
+      line.split(',').map(c=>c.replace(/^"|"$/g,'').trim())
+    ).filter(r=>r.some(c=>c));
+  };
+
   const reader = new FileReader();
   reader.onload = function(e){
     try{
       const buf = e.target.result;
       const bytes = new Uint8Array(buf);
-      let data = [];
 
-      // 앞 200바이트로 HTML 여부 감지
-      const headStr = String.fromCharCode(...bytes.slice(0,200));
-      const isHTML = /<html/i.test(headStr);
-
-      if(isHTML){
-        // UTF-8 시도 → 실패시 EUC-KR로 디코딩
-        let htmlText = '';
-        try {
-          htmlText = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
-        } catch(_) {
-          try { htmlText = new TextDecoder('euc-kr').decode(bytes); }
-          catch(__) { htmlText = new TextDecoder('utf-8').decode(bytes); }
-        }
-        const doc = new DOMParser().parseFromString(htmlText, 'text/html');
-        doc.querySelectorAll('table tr').forEach(tr=>{
-          const cells = [...tr.querySelectorAll('th,td')].map(td=>(td.textContent||'').trim());
-          data.push(cells);
-        });
-      } else {
-        // 진짜 xlsx/xls
-        const wb = XLSX.read(buf, {type:'array'});
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        data = XLSX.utils.sheet_to_json(ws, {header:1});
+      // UTF-8 디코딩 시도
+      let text = '';
+      try {
+        text = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
+      } catch(_) {
+        try { text = new TextDecoder('euc-kr').decode(bytes); }
+        catch(__) { text = new TextDecoder('utf-8').decode(bytes); }
       }
 
-      const orders = parseSSRows(data);
-      ssOrders = orders;
-      document.getElementById('ss-zone').innerHTML =
-        `<div style="color:var(--green);font-size:12px;font-weight:500;">✓ ${file.name}</div>
-         <div class="upload-success">${orders.length}건 인식 완료</div>`;
-      document.getElementById('stat-ss').textContent = orders.length;
+      const trimmed = text.trimStart();
+      let data = [];
+
+      if(/<html/i.test(trimmed.slice(0,300))){
+        // 스마트스토어 xls (실제로는 HTML)
+        data = parseHTMLxls(text);
+      } else if(file.name.endsWith('.csv')){
+        // CSV
+        data = parseCSV(text);
+      } else {
+        // 판별 불가 → HTML로 한번 더 시도
+        data = parseHTMLxls(text);
+        if(data.length < 2){
+          showError('.xlsx 파일은 지원하지 않습니다. 스마트스토어에서 엑셀(xls) 또는 CSV로 다운로드해주세요.');
+          return;
+        }
+      }
+
+      showResult(parseSSRows(data));
     } catch(err){
-      document.getElementById('ss-result').innerHTML =
-        `<div style="color:var(--red);font-size:11px;">파일 읽기 오류: ${err.message}</div>`;
+      showError(err.message);
     }
   };
   reader.readAsArrayBuffer(file);
